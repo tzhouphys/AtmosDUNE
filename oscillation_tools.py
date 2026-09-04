@@ -162,8 +162,9 @@ class ThreeFlavorOscillation:
         self.channel = str(channel)
         self.antineutrino = bool(antineutrino)
 
-    def probability(self, L_km, E_GeV):
+    def probability(self, L_km, E_GeV, channel=None):
         """Return the requested flavor-transition probability."""
+        channel = self.channel if channel is None else str(channel)
         U = Uall(
             self.theta12,
             self.theta23,
@@ -187,10 +188,10 @@ class ThreeFlavorOscillation:
 
         flavor_index = {"e": 0, "mu": 1, "tau": 2}
         try:
-            initial, final = self.channel.split("_")
+            initial, final = channel.split("_")
             amplitude = S[flavor_index[final], flavor_index[initial]]
         except (KeyError, ValueError):
-            raise ValueError(f"Unknown channel: {self.channel}")
+            raise ValueError(f"Unknown channel: {channel}")
 
         return float(np.clip(np.abs(amplitude) ** 2, 0.0, 1.0))
 
