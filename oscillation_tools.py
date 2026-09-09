@@ -6,8 +6,7 @@
     * Calculate two-flavor neutrino oscillation probabilities in both vacuum and matter(constant density)
     * Calculate basic three-flavor neutrino oscillation probabilities in both vacuum and matter(constant density)
     * Calculate dissipative neutrino oscillation probabilities in both vacuum and matter(constant density) using the Lindblad master equation
-    TODO: Add varying matter density for DUNE parametric resonance oscillation
-    TODO: write class for oscillation parameters and methods to calculate probabilities
+    * Calculate three-flavor neutrino oscillation probabilities through a position-dependent (e.g. Earth PREM) matter density
 """
 
 import numpy as np
@@ -512,5 +511,157 @@ def prob_diss(
     )
     return model.probability(L, E_edges, channel=channel)
 
-    
-    #### piecewise constant matter density for DUNE parametric resonance oscillation ####
+
+######## Varying matter density (Earth profile) oscillations ########
+
+EARTH_RADIUS_KM = 6371.0
+
+
+def zenith_to_baseline(cos_theta, overburden_km=20.0, detector_depth_km=1.5):
+    """Convert an atmospheric-neutrino zenith angle cosine to a chord length in km.
+
+    Matches ``zenith_to_baseline`` in ``evt_rate_calc.ipynb``: ``overburden_km``
+    is the average production altitude in the atmosphere and
+    ``detector_depth_km`` is the detector's depth underground.
+    """
+    r_e, d, s = EARTH_RADIUS_KM, overburden_km, detector_depth_km
+    sqrt_term = np.sqrt(
+        4 * cos_theta ** 2 * (s - r_e) ** 2
+        - 4 * (s ** 2 - 2 * r_e * s - d ** 2 - 2 * r_e * d)
+    )
+    return 0.5 * (-2 * cos_theta * (r_e - s) + sqrt_term)
+
+
+def prem_density_profile(s_km, L_km, r_e=EARTH_RADIUS_KM):
+    """Simplified (3-shell) PREM density in g/cm^3.
+
+    ``s_km`` is the distance travelled along a chord of total length
+    ``L_km``; the chord's radial distance from Earth's center is recovered
+    from its impact parameter to look up the density shell.
+    """
+    b = np.sqrt(max(r_e ** 2 - (L_km / 2.0) ** 2, 0.0))
+    x = s_km - L_km / 2.0
+    r = np.sqrt(b ** 2 + x ** 2)
+
+    if r < 3480:
+        return 11.0
+    elif r < 5700:
+        return 5.11
+    elif r < r_e:
+        return 3.15
+    return 0.0
+
+
+class VaryingDensityOscillation:
+    """Three-flavor oscillations through a position-dependent matter density.
+
+    Splits the baseline into ``n_steps`` slices and evolves the flavor
+    state with the matter potential evaluated at the midpoint of each
+    slice, so a non-constant density along the path (Earth's PREM
+    structure, the default via ``density_profile=prem_density_profile``)
+    is captured. A profile that returns a constant value reduces this to
+    :class:`ThreeFlavorOscillation`.
+
+    ``density_profile`` is any callable ``rho(s_km, L_km) -> g/cm^3``,
+    where ``s_km`` is the distance travelled along the baseline and
+    ``L_km`` is the total baseline length.
+    """
+
+    def __init__(
+        self,
+        density_profile=prem_density_profile,
+        Ye=0.5,
+        n_steps=2000,
+        theta12=OSC_PARAMS.theta12,
+        theta13=OSC_PARAMS.theta13,
+        theta23=OSC_PARAMS.theta23,
+        delta_cp=OSC_PARAMS.delta_cp,
+        dm21=OSC_PARAMS.dm21,
+        dm31=OSC_PARAMS.dm31,
+        channel="mu_mu",
+        antineutrino=False,
+    ):
+        self.density_profile = density_profile
+        self.Ye = float(Ye)
+        self.n_steps = int(n_steps)
+        self.theta12 = float(theta12)
+        self.theta13 = float(theta13)
+        self.theta23 = float(theta23)
+        self.delta_cp = float(delta_cp)
+        self.dm21 = float(dm21)
+        self.dm31 = float(dm31)
+        self.channel = str(channel)
+        self.antineutrino = bool(antineutrino)
+
+    @staticmethod
+    def _resolve_baseline(L_km, baseline_type):
+        if baseline_type == "cos":
+            return zenith_to_baseline(L_km)
+        if baseline_type == "km":
+            return L_km
+        raise ValueError("Invalid baseline type. Use 'cos' or 'km'.")
+
+    def _channel_indices(self, channel):
+        channel = self.channel if channel is None else str(channel)
+        flavor_index = {"e": 0, "mu": 1, "tau": 2}
+        try:
+            initial, final = channel.split("_")
+            return flavor_index[final], flavor_index[initial]
+        except (KeyError, ValueError):
+            raise ValueError(f"Unknown channel: {channel}")
+
+    def _propagate(self, L_km, E_GeV, track_profile=False):
+        """Step the flavor evolution operator across the baseline.
+
+        Returns the final evolution operator ``S``, and (only if
+        ``track_profile``) the list of cumulative ``S`` at every slice.
+        """
+        U = Uall(self.theta12, self.theta23, self.theta13, self.delta_cp)
+        if self.antineutrino:
+            U = np.conjugate(U)
+
+        M2_vac_flavor = U @ np.diag([0.0, self.dm21, self.dm31]) @ U.conj().T
+
+        coeff = 2.0 * 1.267
+        dL = L_km / self.n_steps
+
+        S_total = np.eye(3, dtype=complex)
+        S_steps = [] if track_profile else None
+
+        for i in range(self.n_steps):
+            s_mid = (i + 0.5) * dL
+            rho = self.density_profile(s_mid, L_km)
+
+            # Matter potential in eV^2; a -> -a for antineutrinos.
+            a = 2 * 7.63247e-5 * rho * self.Ye * E_GeV
+            if self.antineutrino:
+                a = -a
+
+            M2_flavor = M2_vac_flavor + np.diag([a, 0.0, 0.0])
+            S_step = expm(-1j * coeff * M2_flavor * dL / E_GeV)
+            S_total = S_step @ S_total
+
+            if track_profile:
+                S_steps.append(S_total)
+
+        return S_total, S_steps
+
+    def probability(self, L_km, E_GeV, channel=None, baseline_type="km"):
+        """Return the requested flavor-transition probability."""
+        L_km = self._resolve_baseline(L_km, baseline_type)
+        i_final, i_initial = self._channel_indices(channel)
+        S_total, _ = self._propagate(L_km, E_GeV)
+        return float(np.clip(np.abs(S_total[i_final, i_initial]) ** 2, 0.0, 1.0))
+
+    def probability_profile(self, L_km, E_GeV, channel=None, baseline_type="km"):
+        """Return the channel probability at every slice along the baseline.
+
+        Useful for plotting how the probability builds up against the
+        density profile traversed (e.g. through Earth's mantle/core).
+        """
+        L_km = self._resolve_baseline(L_km, baseline_type)
+        i_final, i_initial = self._channel_indices(channel)
+        _, S_steps = self._propagate(L_km, E_GeV, track_profile=True)
+        return np.array([np.abs(S[i_final, i_initial]) ** 2 for S in S_steps])
+
+    __call__ = probability
